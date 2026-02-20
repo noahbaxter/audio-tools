@@ -5,30 +5,21 @@ Uses BS-Rofo-SW-Fixed (6-stem RoFormer) — best open-source model for stem sepa
 """
 
 import argparse
-import glob
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from urllib.request import urlretrieve
 
+from audio_separator.separator import Separator
+
 GREEN = "\033[32m"
-YELLOW = "\033[33m"
 RED = "\033[31m"
 CYAN = "\033[36m"
 RESET = "\033[0m"
 
 VALID_STEMS = ["vocals", "drums", "bass", "guitar", "piano", "other"]
-STEM_SUFFIX = {
-    "vocals": "Vocals",
-    "drums": "Drums",
-    "bass": "Bass",
-    "guitar": "Guitar",
-    "piano": "Piano",
-    "other": "Other",
-}
 
 MODEL_DIR = Path.home() / ".cache" / "audio-separator-models"
 ROFO_MODEL = "BS-Rofo-SW-Fixed.ckpt"
@@ -50,17 +41,34 @@ def ensure_model():
 
 
 def check_dependencies():
-    if not shutil.which("audio-separator"):
-        print(f"{RED}✗{RESET} audio-separator not found. Install with: pipx install 'audio-separator[cpu]'")
-        sys.exit(1)
     if not shutil.which("ffmpeg"):
         print(f"{RED}✗{RESET} ffmpeg not found. Install with: brew install ffmpeg")
         sys.exit(1)
 
 
-def find_stem_file(tmpdir: str, suffix: str) -> str | None:
-    matches = glob.glob(os.path.join(tmpdir, f"*_({suffix})*.wav"))
-    return matches[0] if matches else None
+def make_separator(output_dir: str) -> Separator:
+    sep = Separator(
+        model_file_dir=str(MODEL_DIR),
+        output_dir=output_dir,
+        output_format="WAV",
+        log_level=30,
+    )
+    model_path = str(MODEL_DIR / ROFO_MODEL)
+    yaml_config = ROFO_CONFIG
+    sep.download_model_files = lambda _fn: (ROFO_MODEL, "MDXC", "BS-Rofo-SW-Fixed", model_path, yaml_config)
+
+    # BS-Rofo-SW-Fixed is a RoFormer model but the yaml filename doesn't contain
+    # "roformer", so audio-separator won't auto-detect it. Patch the yaml loader
+    # to force the flag.
+    _orig_load_yaml = sep.load_model_data_from_yaml
+    def _load_yaml_as_roformer(yaml_filename):
+        data = _orig_load_yaml(yaml_filename)
+        data["is_roformer"] = True
+        return data
+    sep.load_model_data_from_yaml = _load_yaml_as_roformer
+
+    sep.load_model(ROFO_MODEL)
+    return sep
 
 
 def output_stem(src: str, dst_base: str, fmt: str):
@@ -88,7 +96,16 @@ def output_stem(src: str, dst_base: str, fmt: str):
     print(f"  {GREEN}✓{RESET} {os.path.basename(dst)}")
 
 
-def separate_file(input_file: str, requested: set, fmt: str):
+def match_stem_file(output_files: list, stem: str) -> str | None:
+    stem_lower = stem.lower()
+    for f in output_files:
+        name = os.path.basename(f).lower()
+        if f"({stem_lower})" in name or f"_{stem_lower}_" in name or f"_{stem_lower}." in name:
+            return f
+    return None
+
+
+def separate_file(sep: Separator, input_file: str, requested: set, fmt: str):
     input_path = Path(input_file).resolve()
     if not input_path.is_file():
         print(f"{RED}✗{RESET} File not found: {input_file}")
@@ -98,70 +115,65 @@ def separate_file(input_file: str, requested: set, fmt: str):
     output_dir = input_path.parent / "separated"
     output_dir.mkdir(exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        print(f"Separating stems from {CYAN}{input_path.name}{RESET}...")
+    print(f"Separating stems from {CYAN}{input_path.name}{RESET}...")
 
-        cmd = [
-            "audio-separator", str(input_path),
-            "--model_filename", ROFO_MODEL,
-            "--config_path", str(MODEL_DIR / ROFO_CONFIG),
-            "--model_file_dir", str(MODEL_DIR),
-            "--output_dir", tmpdir,
-            "--output_format", "WAV",
-            "--log_level", "warning",
-        ]
+    sep.output_dir = str(output_dir)
+    try:
+        output_files = sep.separate(str(input_path))
+    except Exception as e:
+        print(f"{RED}✗{RESET} audio-separator failed: {e}")
+        return
 
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            print(f"{RED}✗{RESET} audio-separator failed")
-            return
+    # Map output files to stem names
+    for stem in VALID_STEMS:
+        if stem == "other" or stem not in requested:
+            continue
+        src = match_stem_file(output_files, stem)
+        if not src:
+            print(f"  {RED}✗{RESET} Could not find {stem} stem in output")
+            continue
+        dst = str(output_dir / f"{basename}_{stem}")
+        output_stem(src, dst, fmt)
 
-        # Extract requested stems (excluding "other" which is handled separately)
-        for stem in VALID_STEMS:
-            if stem == "other" or stem not in requested:
-                continue
-            suffix = STEM_SUFFIX[stem]
-            src = find_stem_file(tmpdir, suffix)
-            if not src:
-                print(f"  {RED}✗{RESET} Could not find {stem} stem in output")
-                continue
-            dst = str(output_dir / f"{basename}_{stem}.wav")
-            output_stem(src, dst, fmt)
+    # Mix remainder stems only if --other was requested
+    if "other" in requested:
+        remainder_stems = [s for s in VALID_STEMS if s != "other" and s not in requested]
 
-        # Mix remainder stems only if --other was requested
-        if "other" in requested:
-            remainder_stems = [s for s in VALID_STEMS if s != "other" and s not in requested]
+        remainder_files = []
+        other_src = match_stem_file(output_files, "other")
+        if other_src:
+            remainder_files.append(other_src)
+        for stem in remainder_stems:
+            src = match_stem_file(output_files, stem)
+            if src:
+                remainder_files.append(src)
 
-            # Collect all unrequested stem files + the model's "other" stem
-            remainder_files = []
-            other_src = find_stem_file(tmpdir, "Other")
-            if other_src:
-                remainder_files.append(other_src)
-            for stem in remainder_stems:
-                src = find_stem_file(tmpdir, STEM_SUFFIX[stem])
-                if src:
-                    remainder_files.append(src)
+        remainder_dst = str(output_dir / f"{basename}_other")
 
-            remainder_dst = str(output_dir / f"{basename}_other.wav")
+        if len(remainder_files) == 1:
+            output_stem(remainder_files[0], remainder_dst, fmt)
+        elif len(remainder_files) > 1:
+            print(f"  Mixing {len(remainder_files)} remaining stems...")
+            mix_dst = f"{remainder_dst}.wav"
+            ffmpeg_cmd = ["ffmpeg"]
+            for f in remainder_files:
+                ffmpeg_cmd.extend(["-i", f])
+            ffmpeg_cmd.extend([
+                "-filter_complex",
+                f"amix=inputs={len(remainder_files)}:duration=longest:normalize=0",
+                mix_dst, "-y",
+            ])
+            subprocess.run(ffmpeg_cmd, capture_output=True)
 
-            if len(remainder_files) == 1:
-                output_stem(remainder_files[0], remainder_dst, fmt)
-            elif len(remainder_files) > 1:
-                print(f"  Mixing {len(remainder_files)} remaining stems...")
-                ffmpeg_cmd = ["ffmpeg"]
-                for f in remainder_files:
-                    ffmpeg_cmd.extend(["-i", f])
-                ffmpeg_cmd.extend([
-                    "-filter_complex",
-                    f"amix=inputs={len(remainder_files)}:duration=longest:normalize=0",
-                    remainder_dst, "-y",
-                ])
-                subprocess.run(ffmpeg_cmd, capture_output=True)
+            if os.path.isfile(mix_dst):
+                output_stem(mix_dst, remainder_dst, fmt)
+            else:
+                print(f"  {RED}✗{RESET} Failed to mix remainder stems")
 
-                if os.path.isfile(remainder_dst):
-                    output_stem(remainder_dst, remainder_dst, fmt)
-                else:
-                    print(f"  {RED}✗{RESET} Failed to mix remainder stems")
+    # Clean up raw separator output files we don't need
+    for f in output_files:
+        if os.path.isfile(f):
+            os.remove(f)
 
 
 def main():
@@ -204,8 +216,10 @@ def main():
     ensure_model()
     print(f"Using {CYAN}BS-Rofo-SW-Fixed{RESET} (6-stem RoFormer)")
 
+    sep = make_separator(os.getcwd())
+
     for f in args.files:
-        separate_file(f, requested, fmt)
+        separate_file(sep, f, requested, fmt)
 
     print(f"{GREEN}Done.{RESET}")
 
